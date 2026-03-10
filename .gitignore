@@ -1,0 +1,5 @@
+/target/
+*.dll.old
+ime_log.txt
+reg_log.txt
+*.png

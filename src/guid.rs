@@ -1,0 +1,11 @@
+use windows::core::GUID;
+
+// akaza-ime Text Service CLSID
+// Generated with uuidgen: {F4E9A3D1-6B2C-4E8F-9A1D-3C5E7B8F2A4D}
+pub const CLSID_AKAZA_TEXT_SERVICE: GUID =
+    GUID::from_u128(0xF4E9A3D1_6B2C_4E8F_9A1D_3C5E7B8F2A4D);
+
+// Language profile GUID
+// {A1B2C3D4-5E6F-7890-ABCD-EF1234567890}
+pub const GUID_AKAZA_PROFILE: GUID =
+    GUID::from_u128(0xA1B2C3D4_5E6F_7890_ABCD_EF1234567890);

@@ -1,0 +1,27 @@
+[package]
+name = "akaza-ime"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+libakaza = { git = "https://github.com/akaza-im/akaza", branch = "main" }
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Ole",
+    "Win32_System_Registry",
+    "Win32_System_SystemServices",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_TextServices",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-implement = "0.60"
+windows-core = "0.61"
+anyhow = "1.0"
+log = "0.4"
+dunce = "1"
