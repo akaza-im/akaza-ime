@@ -21,17 +21,25 @@ use crate::input_state::{InputMode, InputState};
 // ログ
 // ---------------------------------------------------------------------------
 
+#[cfg(debug_assertions)]
 fn log(msg: &str) {
     use std::io::Write;
+    let path = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("akaza")
+        .join("ime_log.txt");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(r"C:\dev\akaza-ime\ime_log.txt")
+        .open(&path)
     {
         let _ = writeln!(f, "{msg}");
         let _ = f.flush();
     }
 }
+
+#[cfg(not(debug_assertions))]
+fn log(_msg: &str) {}
 
 // ---------------------------------------------------------------------------
 // CompositionSink
