@@ -436,6 +436,17 @@ impl AkazaTextService {
             "cursor_right" => self.handle_segment_next(context),
             "convert_to_full_hiragana" => self.handle_convert_to_hiragana(context),
             "convert_to_full_katakana" => self.handle_convert_to_katakana(context),
+            _ if cmd.starts_with("press_number_") => {
+                // 変換中に数字 → 確定して全角数字を入力
+                if let Some(n) = cmd.strip_prefix("press_number_").and_then(|s| s.parse::<u32>().ok()) {
+                    let full = char::from_u32('０' as u32 + n).unwrap_or_else(|| (b'0' + n as u8) as char);
+                    self.handle_commit(context)?;
+                    self.state.borrow_mut().preedit.push(full);
+                    self.update_composition(context)
+                } else {
+                    Ok(())
+                }
+            }
             _ => {
                 log(&format!("unhandled command: {cmd}"));
                 Ok(())
