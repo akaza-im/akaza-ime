@@ -13,6 +13,7 @@ use libakaza::graph::candidate::Candidate;
 use libakaza::keymap::{KeyPattern, KeyState, Keymap};
 use libakaza::romkan::RomKanConverter;
 
+use crate::candidate_window::CandidateWindow;
 use crate::edit_session::EditSession;
 use crate::input_state::{InputMode, InputState};
 
@@ -58,6 +59,7 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
         if let Ok(mut comp) = self.composition.try_borrow_mut() {
             *comp = None;
         }
+        crate::candidate_window::hide_candidate_window();
         Ok(())
     }
 }
@@ -287,6 +289,7 @@ pub struct AkazaTextService {
     client_id: RefCell<u32>,
     composition: Rc<RefCell<Option<ITfComposition>>>,
     state: RefCell<InputState>,
+    candidate_window: RefCell<CandidateWindow>,
 }
 
 impl AkazaTextService {
@@ -296,6 +299,7 @@ impl AkazaTextService {
             client_id: RefCell::new(0),
             composition: Rc::new(RefCell::new(None)),
             state: RefCell::new(InputState::new()),
+            candidate_window: RefCell::new(CandidateWindow::new()),
         }
     }
 
@@ -727,6 +731,7 @@ impl AkazaTextService {
         )?;
 
         self.state.borrow_mut().reset();
+        self.candidate_window.borrow_mut().hide();
         Ok(())
     }
 
@@ -803,9 +808,10 @@ impl AkazaTextService {
     // -----------------------------------------------------------------------
 
     fn handle_cancel(&self, context: &ITfContext) -> Result<()> {
-        self.set_composition_text(context, "")?;
+        let _ = self.set_composition_text_with_rect(context, "");
         self.end_composition(context)?;
         self.state.borrow_mut().reset();
+        self.candidate_window.borrow_mut().hide();
         Ok(())
     }
 
@@ -825,9 +831,10 @@ impl AkazaTextService {
 
             if state.is_empty() {
                 drop(state);
-                self.set_composition_text(context, "")?;
+                let _ = self.set_composition_text_with_rect(context, "");
                 self.end_composition(context)?;
                 self.state.borrow_mut().reset();
+                self.candidate_window.borrow_mut().hide();
                 return Ok(());
             }
         }
@@ -900,9 +907,44 @@ impl AkazaTextService {
     // -----------------------------------------------------------------------
 
     fn update_composition(&self, context: &ITfContext) -> Result<()> {
-        let text = self.state.borrow().display_text();
+        let state = self.state.borrow();
+        let text = state.display_text();
+        let is_converting = state.mode == InputMode::Converting && !state.segments.is_empty();
+        let cand_info = if is_converting {
+            let seg_idx = state.focus_segment;
+            let selected = state.segment_indices.get(seg_idx).copied().unwrap_or(0);
+            let candidates: Vec<String> = state
+                .segments
+                .get(seg_idx)
+                .map(|seg| seg.iter().map(|c| c.surface.clone()).collect())
+                .unwrap_or_default();
+            Some((candidates, selected))
+        } else {
+            None
+        };
+        drop(state);
+
         self.start_composition_if_needed(context)?;
-        self.set_composition_text(context, &text)
+        let caret_rect = self.set_composition_text_with_rect(context, &text)?;
+
+        match (cand_info, caret_rect) {
+            (Some((candidates, selected)), Some(rect)) => {
+                self.candidate_window
+                    .borrow_mut()
+                    .show(&candidates, selected, rect.left, rect.bottom);
+            }
+            (Some((candidates, selected)), None) => {
+                // キャレット位置が取れなくても表示（左上にフォールバック）
+                self.candidate_window
+                    .borrow_mut()
+                    .show(&candidates, selected, 0, 0);
+            }
+            _ => {
+                self.candidate_window.borrow_mut().hide();
+            }
+        }
+
+        Ok(())
     }
 
     fn start_composition_if_needed(&self, context: &ITfContext) -> Result<()> {
@@ -955,12 +997,20 @@ impl AkazaTextService {
         Ok(())
     }
 
-    fn set_composition_text(&self, context: &ITfContext, text: &str) -> Result<()> {
+    fn set_composition_text_with_rect(
+        &self,
+        context: &ITfContext,
+        text: &str,
+    ) -> Result<Option<RECT>> {
         let comp = self.composition.borrow().clone();
-        let Some(comp) = comp else { return Ok(()) };
+        let Some(comp) = comp else {
+            return Ok(None);
+        };
 
         let text_w: Vec<u16> = text.encode_utf16().collect();
         let client_id = self.client_id();
+        let rect_out: Rc<RefCell<Option<RECT>>> = Rc::new(RefCell::new(None));
+        let rect_out2 = rect_out.clone();
 
         let _ = EditSession::execute(
             &context.clone(),
@@ -969,13 +1019,24 @@ impl AkazaTextService {
             move |ctx, ec| unsafe {
                 let range = comp.GetRange()?;
                 range.SetText(ec, 0, &text_w)?;
+
+                // キャレット位置を取得 (Collapse する前に)
+                if let Ok(view) = ctx.GetActiveView() {
+                    let mut rect = RECT::default();
+                    let mut clipped = BOOL::default();
+                    if view.GetTextExt(ec, &range, &mut rect, &mut clipped).is_ok() {
+                        *rect_out2.borrow_mut() = Some(rect);
+                    }
+                }
+
                 range.Collapse(ec, TfAnchor(1))?;
                 ctx.SetSelection(ec, &[make_selection(range)])?;
                 Ok(())
             },
         )?;
 
-        Ok(())
+        let result = rect_out.borrow().clone();
+        Ok(result)
     }
 
     fn end_composition(&self, context: &ITfContext) -> Result<()> {
@@ -1073,6 +1134,7 @@ impl ITfTextInputProcessor_Impl for AkazaTextService_Impl {
             let _ = self.composition.try_borrow_mut().map(|mut c| c.take());
 
             let _ = AkazaTextService::unadvise_key_event_sink(self);
+            self.candidate_window.borrow_mut().destroy();
             self.state.borrow_mut().reset();
             *self.thread_mgr.borrow_mut() = None;
             *self.client_id.borrow_mut() = 0;
@@ -1089,7 +1151,13 @@ impl ITfTextInputProcessor_Impl for AkazaTextService_Impl {
 // ---------------------------------------------------------------------------
 
 impl ITfKeyEventSink_Impl for AkazaTextService_Impl {
-    fn OnSetFocus(&self, _fforeground: BOOL) -> Result<()> {
+    fn OnSetFocus(&self, fforeground: BOOL) -> Result<()> {
+        if !fforeground.as_bool() {
+            // フォーカス喪失: TSF がコンポジションを終了するので内部状態もリセット
+            self.candidate_window.borrow_mut().hide();
+            let _ = self.composition.try_borrow_mut().map(|mut c| c.take());
+            self.state.borrow_mut().reset();
+        }
         Ok(())
     }
 

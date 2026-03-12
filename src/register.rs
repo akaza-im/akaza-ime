@@ -151,6 +151,13 @@ fn register_profile() -> Result<()> {
 
         let display_name: Vec<u16> = "Akaza\0".encode_utf16().collect();
 
+        // アイコン: DLL 自身に埋め込まれたリソース (インデックス 0)
+        let module_path = get_module_path()?;
+        let icon_path_w: Vec<u16> = module_path
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
         // Use raw vtable call — the windows-rs wrapper panics on empty &[] for icon file
         let hr = (Interface::vtable(&profiles).AddLanguageProfile)(
             Interface::as_raw(&profiles),
@@ -159,8 +166,8 @@ fn register_profile() -> Result<()> {
             &GUID_AKAZA_PROFILE,
             PCWSTR(display_name.as_ptr()),
             (display_name.len() - 1) as u32, // exclude null terminator
-            PCWSTR(std::ptr::null()),
-            0,
+            PCWSTR(icon_path_w.as_ptr()),
+            (icon_path_w.len() - 1) as u32,
             0,
         );
         // E_FAIL = already registered, treat as OK
