@@ -17,6 +17,8 @@ pub struct InputState {
     pub mode: InputMode,
     /// ローマ字入力バッファ (未確定のローマ字)
     pub romaji_buffer: String,
+    /// 入力されたローマ字の全履歴 (F9/F10 用)
+    pub raw_input: String,
     /// 変換前のひらがな
     pub preedit: String,
     /// セグメントごとの候補リスト: segments[seg_idx][cand_idx]
@@ -32,6 +34,7 @@ impl InputState {
         Self {
             mode: InputMode::Direct,
             romaji_buffer: String::new(),
+            raw_input: String::new(),
             preedit: String::new(),
             segments: Vec::new(),
             segment_indices: Vec::new(),
@@ -41,6 +44,7 @@ impl InputState {
 
     pub fn reset(&mut self) {
         self.romaji_buffer.clear();
+        self.raw_input.clear();
         self.preedit.clear();
         self.segments.clear();
         self.segment_indices.clear();

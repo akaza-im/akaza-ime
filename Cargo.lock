@@ -30,6 +30,7 @@ dependencies = [
  "dirs 6.0.0",
  "dunce",
  "embed-resource",
+ "kelp",
  "libakaza",
  "log",
  "windows",
@@ -581,8 +582,8 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "libakaza"
-version = "2026.310.0"
-source = "git+https://github.com/akaza-im/akaza?branch=main#a544f204915b88ccdb9d01b6ae8a6f5d58065fc0"
+version = "2026.312.0"
+source = "git+https://github.com/akaza-im/akaza?branch=main#8b75932b05f9932706a02feee8a7a96da0b8120c"
 dependencies = [
  "aes",
  "anyhow",

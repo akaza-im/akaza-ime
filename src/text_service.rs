@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
@@ -12,6 +13,8 @@ use libakaza::engine::bigram_word_viterbi_engine::BigramWordViterbiEngineBuilder
 use libakaza::graph::candidate::Candidate;
 use libakaza::keymap::{KeyPattern, KeyState, Keymap};
 use libakaza::romkan::RomKanConverter;
+use libakaza::user_side_data::encryption_key::load_or_create_default_encryption_key;
+use libakaza::user_side_data::user_data::UserData;
 
 use crate::candidate_window::CandidateWindow;
 use crate::edit_session::EditSession;
@@ -82,6 +85,41 @@ fn romkan_convert(input: &str) -> Option<String> {
     })
 }
 
+fn load_user_data() -> Arc<Mutex<UserData>> {
+    let encryption_key = match load_or_create_default_encryption_key() {
+        Ok(key) => Some(key),
+        Err(e) => {
+            log(&format!("encryption_key: load error: {e}"));
+            None
+        }
+    };
+    match UserData::load_from_default_path(encryption_key.as_deref()) {
+        Ok(ud) => Arc::new(Mutex::new(ud)),
+        Err(e) => {
+            log(&format!("user_data: load error: {e}"));
+            Arc::new(Mutex::new(UserData::default()))
+        }
+    }
+}
+
+fn spawn_save_thread(user_data: Arc<Mutex<UserData>>) {
+    std::thread::Builder::new()
+        .name("user-data-save".to_string())
+        .spawn(move || {
+            let interval = std::time::Duration::from_secs(3);
+            loop {
+                if let Ok(mut data) = user_data.lock() {
+                    if let Err(e) = data.write_user_files() {
+                        // ログのみ、続行
+                        let _ = e;
+                    }
+                }
+                std::thread::sleep(interval);
+            }
+        })
+        .ok();
+}
+
 fn load_engine() -> Option<Box<dyn HenkanEngine>> {
     log("load_engine: start");
     let config = Config::load().unwrap_or_default();
@@ -91,10 +129,15 @@ fn load_engine() -> Option<Box<dyn HenkanEngine>> {
         config.engine.dicts.len()
     ));
 
-    let builder = BigramWordViterbiEngineBuilder::new(config.engine);
+    let user_data = load_user_data();
+    let save_handle = user_data.clone();
+
+    let mut builder = BigramWordViterbiEngineBuilder::new(config.engine);
+    builder.user_data(user_data);
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| builder.build())) {
         Ok(Ok(engine)) => {
             log("load_engine: OK");
+            spawn_save_thread(save_handle);
             Some(Box::new(engine))
         }
         Ok(Err(e)) => {
@@ -371,6 +414,11 @@ impl AkazaTextService {
             }
             // コマンドなし → ひらがなモードまたは変換中なら文字入力
             if state.mode == InputMode::Hiragana || state.mode == InputMode::Converting {
+                if shift {
+                    // Shift+英字: 大文字をそのまま入力
+                    let upper = (vk as u8) as char; // 'A'-'Z'
+                    return Some(KeyAction::CharInput(upper));
+                }
                 return Some(KeyAction::CharInput(ch));
             }
             return None;
@@ -440,6 +488,9 @@ impl AkazaTextService {
             "cursor_right" => self.handle_segment_next(context),
             "convert_to_full_hiragana" => self.handle_convert_to_hiragana(context),
             "convert_to_full_katakana" => self.handle_convert_to_katakana(context),
+            "convert_to_half_katakana" => self.handle_convert_to_half_katakana(context),
+            "convert_to_full_romaji" => self.handle_convert_to_full_romaji(context),
+            "convert_to_half_romaji" => self.handle_convert_to_half_romaji(context),
             _ if cmd.starts_with("press_number_") => {
                 // 変換中に数字 → 確定して全角数字を入力
                 if let Some(n) = cmd.strip_prefix("press_number_").and_then(|s| s.parse::<u32>().ok()) {
@@ -471,6 +522,7 @@ impl AkazaTextService {
             }
 
             state.romaji_buffer.push(ch);
+            state.raw_input.push(ch);
 
             if let Some(converted) = romkan_convert(&state.romaji_buffer) {
                 if converted != state.romaji_buffer {
@@ -498,6 +550,7 @@ impl AkazaTextService {
                 self.handle_commit(context)?;
                 let mut state = self.state.borrow_mut();
                 state.romaji_buffer.push(ascii_ch);
+                state.raw_input.push(ascii_ch);
                 if let Some(converted) = romkan_convert(&state.romaji_buffer) {
                     if converted != state.romaji_buffer {
                         let (kana, pending) =
@@ -519,6 +572,7 @@ impl AkazaTextService {
             }
 
             state.romaji_buffer.push(ascii_ch);
+            state.raw_input.push(ascii_ch);
             if let Some(converted) = romkan_convert(&state.romaji_buffer) {
                 if converted != state.romaji_buffer {
                     let (kana, pending) = split_kana_pending(&converted, &state.romaji_buffer);
@@ -673,6 +727,118 @@ impl AkazaTextService {
         let mut state = self.state.borrow_mut();
         state.segments = vec![vec![Candidate {
             surface: katakana,
+            yomi: hiragana,
+            cost: 0.0,
+            compound_word: false,
+        }]];
+        state.segment_indices = vec![0];
+        state.focus_segment = 0;
+        state.mode = InputMode::Converting;
+        drop(state);
+        self.update_composition(context)
+    }
+
+    fn handle_convert_to_half_katakana(&self, context: &ITfContext) -> Result<()> {
+        let hiragana = {
+            let mut state = self.state.borrow_mut();
+            if state.mode != InputMode::Converting && state.mode != InputMode::Hiragana {
+                return Ok(());
+            }
+            if !state.romaji_buffer.is_empty() {
+                if let Some(converted) = romkan_convert(&state.romaji_buffer) {
+                    state.preedit.push_str(&converted);
+                    state.romaji_buffer.clear();
+                }
+            }
+            state.preedit.clone()
+        };
+
+        let half_kata = kelp::z2h(
+            &kelp::hira2kata(&hiragana, kelp::ConvOption::default()),
+            kelp::ConvOption::default(),
+        );
+
+        let mut state = self.state.borrow_mut();
+        state.segments = vec![vec![Candidate {
+            surface: half_kata,
+            yomi: hiragana,
+            cost: 0.0,
+            compound_word: false,
+        }]];
+        state.segment_indices = vec![0];
+        state.focus_segment = 0;
+        state.mode = InputMode::Converting;
+        drop(state);
+        self.update_composition(context)
+    }
+
+    fn handle_convert_to_full_romaji(&self, context: &ITfContext) -> Result<()> {
+        let (hiragana, raw) = {
+            let mut state = self.state.borrow_mut();
+            if state.mode != InputMode::Converting && state.mode != InputMode::Hiragana {
+                return Ok(());
+            }
+            if !state.romaji_buffer.is_empty() {
+                if let Some(converted) = romkan_convert(&state.romaji_buffer) {
+                    state.preedit.push_str(&converted);
+                    state.romaji_buffer.clear();
+                }
+            }
+            (state.preedit.clone(), state.raw_input.clone())
+        };
+
+        let full_romaji = kelp::h2z(
+            &raw,
+            kelp::ConvOption {
+                ascii: true,
+                digit: true,
+                kana: true,
+                ..Default::default()
+            },
+        );
+
+        let mut state = self.state.borrow_mut();
+        state.segments = vec![vec![Candidate {
+            surface: full_romaji,
+            yomi: hiragana,
+            cost: 0.0,
+            compound_word: false,
+        }]];
+        state.segment_indices = vec![0];
+        state.focus_segment = 0;
+        state.mode = InputMode::Converting;
+        drop(state);
+        self.update_composition(context)
+    }
+
+    fn handle_convert_to_half_romaji(&self, context: &ITfContext) -> Result<()> {
+        let (hiragana, raw) = {
+            let mut state = self.state.borrow_mut();
+            if state.mode != InputMode::Converting && state.mode != InputMode::Hiragana {
+                return Ok(());
+            }
+            if !state.romaji_buffer.is_empty() {
+                if let Some(converted) = romkan_convert(&state.romaji_buffer) {
+                    state.preedit.push_str(&converted);
+                    state.romaji_buffer.clear();
+                }
+            }
+            (state.preedit.clone(), state.raw_input.clone())
+        };
+
+        let half_romaji = kelp::z2h(
+            &raw,
+            kelp::ConvOption {
+                ascii: true,
+                digit: true,
+                kana: true,
+                ..Default::default()
+            },
+        );
+
+        let mut state = self.state.borrow_mut();
+        state.segments = vec![vec![Candidate {
+            surface: half_romaji,
             yomi: hiragana,
             cost: 0.0,
             compound_word: false,
