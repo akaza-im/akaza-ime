@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
@@ -76,6 +77,8 @@ thread_local! {
     static ENGINE_LOADED: RefCell<bool> = const { RefCell::new(false) };
     static THREAD_KEYMAP: RefCell<Option<HashMap<KeyPattern, String>>> = const { RefCell::new(None) };
     static THREAD_ROMKAN: RefCell<Option<RomKanConverter>> = const { RefCell::new(None) };
+    /// 辞書・モデルファイルのタイムスタンプを記録 (パス → 更新日時)
+    static DICT_TIMESTAMPS: RefCell<HashMap<String, SystemTime>> = RefCell::new(HashMap::new());
 }
 
 fn romkan_convert(input: &str) -> Option<String> {
@@ -152,17 +155,75 @@ fn load_engine() -> Option<Box<dyn HenkanEngine>> {
     }
 }
 
+/// 監視対象ファイルの現在のタイムスタンプを収集する
+fn collect_dict_timestamps(config: &Config) -> HashMap<String, SystemTime> {
+    let mut stamps = HashMap::new();
+
+    // 設定ファイル自体
+    if let Ok(config_path) = Config::file_name() {
+        if let Ok(meta) = std::fs::metadata(&config_path) {
+            if let Ok(t) = meta.modified() {
+                stamps.insert(config_path.to_string_lossy().into_owned(), t);
+            }
+        }
+    }
+
+    // 辞書ファイル
+    for d in &config.engine.dicts {
+        if let Ok(meta) = std::fs::metadata(&d.path) {
+            if let Ok(t) = meta.modified() {
+                stamps.insert(d.path.clone(), t);
+            }
+        }
+    }
+
+    // モデルディレクトリ内のファイル
+    if let Ok(entries) = std::fs::read_dir(&config.engine.model) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    if let Ok(t) = meta.modified() {
+                        stamps.insert(entry.path().to_string_lossy().into_owned(), t);
+                    }
+                }
+            }
+        }
+    }
+
+    stamps
+}
+
 fn ensure_engine() {
     ENGINE_LOADED.with(|loaded| {
         if *loaded.borrow() {
+            // 既にロード済み → タイムスタンプの変化を確認
+            let config = Config::load().unwrap_or_default();
+            let current = collect_dict_timestamps(&config);
+            let changed = DICT_TIMESTAMPS.with(|ts| *ts.borrow() != current);
+            if !changed {
+                return; // 変化なし
+            }
+            log("ensure_engine: dict/model files changed, reloading");
+            // タイムスタンプ更新 & エンジン再ロード
+            DICT_TIMESTAMPS.with(|ts| *ts.borrow_mut() = current);
+            if let Some(engine) = load_engine() {
+                THREAD_ENGINE.with(|e| *e.borrow_mut() = Some(engine));
+            }
             return;
         }
+
+        // 初回ロード
         *loaded.borrow_mut() = true;
         if let Some(engine) = load_engine() {
             THREAD_ENGINE.with(|e| *e.borrow_mut() = Some(engine));
         }
         // キーマップをロード
         let config = Config::load().unwrap_or_default();
+
+        // タイムスタンプを記録
+        let stamps = collect_dict_timestamps(&config);
+        DICT_TIMESTAMPS.with(|ts| *ts.borrow_mut() = stamps);
+
         match Keymap::load(&config.keymap) {
             Ok(km) => {
                 log(&format!("keymap: loaded {} entries", km.len()));
@@ -183,6 +244,7 @@ fn ensure_engine() {
 
 fn invalidate_engine() {
     ENGINE_LOADED.with(|loaded| *loaded.borrow_mut() = false);
+    DICT_TIMESTAMPS.with(|ts| ts.borrow_mut().clear());
 }
 
 fn panic_message(p: &Box<dyn std::any::Any + Send>) -> String {
@@ -523,16 +585,31 @@ impl AkazaTextService {
                 return self.handle_commit_and_continue(context, ch);
             }
 
-            state.romaji_buffer.push(ch);
             state.raw_input.push(ch);
 
-            if let Some(converted) = romkan_convert(&state.romaji_buffer) {
-                if converted != state.romaji_buffer {
-                    let (kana, pending) = split_kana_pending(&converted, &state.romaji_buffer);
-                    if !kana.is_empty() {
-                        state.preedit.push_str(&kana);
+            if ch.is_ascii_uppercase() {
+                // 大文字はローマ字変換せずそのまま preedit に入れる
+                // 未確定のローマ字バッファがあれば先にフラッシュ
+                if !state.romaji_buffer.is_empty() {
+                    let buf = std::mem::take(&mut state.romaji_buffer);
+                    if let Some(flushed) = romkan_convert(&buf) {
+                        state.preedit.push_str(&flushed);
+                    } else {
+                        state.preedit.push_str(&buf);
                     }
-                    state.romaji_buffer = pending;
+                }
+                state.preedit.push(ch);
+            } else {
+                state.romaji_buffer.push(ch);
+                if let Some(converted) = romkan_convert(&state.romaji_buffer) {
+                    if converted != state.romaji_buffer {
+                        let (kana, pending) =
+                            split_kana_pending(&converted, &state.romaji_buffer);
+                        if !kana.is_empty() {
+                            state.preedit.push_str(&kana);
+                        }
+                        state.romaji_buffer = pending;
+                    }
                 }
             }
         }
