@@ -298,7 +298,9 @@ fn lookup_keymap(key_state: KeyState, key_name: &str, ctrl: bool, shift: bool) -
         for (pattern, command) in km {
             if pattern.key == key_name
                 && pattern.ctrl == ctrl
-                && pattern.shift == shift
+                // パターンが shift=true なら Shift 必須、
+                // パターンが shift=false なら Shift の有無を問わない
+                && (!pattern.shift || shift)
                 && pattern.states.contains(&key_state)
             {
                 return Some(command.clone());
