@@ -17,25 +17,25 @@ Windows 用の日本語かな漢字変換 IME。
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│                   akaza_ime.dll (COM DLL)                 │
+│                   akaza_ime.dll (COM DLL)                │
 │                                                          │
 │  ┌────────────────────┐    ┌──────────────────────────┐  │
 │  │  TSF Frontend      │    │     libakaza             │  │
-│  │                    │    │                           │  │
+│  │                    │    │                          │  │
 │  │ • ITfTextInput-    │    │ • かな漢字変換           │  │
 │  │   ProcessorEx      │    │ • k-best 変換            │  │
 │  │ • ITfKeyEventSink  │    │ • ユーザー学習           │  │
 │  │ • ITfComposition-  │    │ • モデル/辞書ロード      │  │
-│  │   Sink             │    │                           │  │
-│  │ • ローマ字→かな    │    │                           │  │
+│  │   Sink             │    │                          │  │
+│  │ • ローマ字=>かな   │    │                           │  │
 │  │ • キー入力処理     │    │                           │  │
 │  └────────────────────┘    └──────────────────────────┘  │
 │                                                          │
 │  %APPDATA%/akaza/                                        │
 │  ├── model/default/                                      │
-│  │   ├── unigram.model      (MARISA Trie)               │
-│  │   ├── bigram.model       (MARISA Trie)               │
-│  │   └── SKK-JISYO.akaza   (MARISA Trie)               │
+│  │   ├── unigram.model      (MARISA Trie)                │
+│  │   ├── bigram.model       (MARISA Trie)                │
+│  │   └── SKK-JISYO.akaza    (MARISA Trie)                │
 │  └── romkan/                                             │
 │      └── default.yml                                     │
 └──────────────────────────────────────────────────────────┘
