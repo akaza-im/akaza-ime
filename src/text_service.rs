@@ -711,7 +711,11 @@ impl AkazaTextService {
             return Ok(());
         }
 
-        let hiragana = state.preedit.clone();
+        // 全角数字を半角に正規化 (辞書のキーが半角のため)
+        let hiragana: String = state.preedit.chars().map(|c| match c {
+            '０'..='９' => (b'0' + (c as u32 - '０' as u32) as u8) as char,
+            _ => c,
+        }).collect();
         drop(state);
 
         let segments = self.convert_segments(&hiragana);
@@ -1044,6 +1048,7 @@ impl AkazaTextService {
         )?;
 
         self.state.borrow_mut().reset();
+        self.candidate_window.borrow_mut().hide();
         self.state.borrow_mut().romaji_buffer.push(next_ch);
         Ok(())
     }
