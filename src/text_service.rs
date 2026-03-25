@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::SystemTime;
 
 use windows::core::*;
@@ -72,13 +72,29 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
 // グローバルリソース (thread-local)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// エンジンスレッドとの通信
+// ---------------------------------------------------------------------------
+
+enum EngineRequest {
+    Convert {
+        yomi: String,
+        tx: mpsc::Sender<Vec<Vec<Candidate>>>,
+    },
+    Learn {
+        candidates: Vec<Candidate>,
+    },
+    Shutdown,
+}
+
+// SAFETY: EngineRequest の各フィールドは Send (String, Vec, mpsc::Sender)
+unsafe impl Send for EngineRequest {}
+
 thread_local! {
-    static THREAD_ENGINE: RefCell<Option<Box<dyn HenkanEngine>>> = const { RefCell::new(None) };
+    static ENGINE_TX: RefCell<Option<mpsc::Sender<EngineRequest>>> = const { RefCell::new(None) };
     static ENGINE_LOADED: RefCell<bool> = const { RefCell::new(false) };
     static THREAD_KEYMAP: RefCell<Option<HashMap<KeyPattern, String>>> = const { RefCell::new(None) };
     static THREAD_ROMKAN: RefCell<Option<RomKanConverter>> = const { RefCell::new(None) };
-    /// 辞書・モデルファイルのタイムスタンプを記録 (パス → 更新日時)
-    static DICT_TIMESTAMPS: RefCell<HashMap<String, SystemTime>> = RefCell::new(HashMap::new());
 }
 
 fn romkan_convert(input: &str) -> Option<String> {
@@ -193,37 +209,78 @@ fn collect_dict_timestamps(config: &Config) -> HashMap<String, SystemTime> {
     stamps
 }
 
+/// タイムスタンプチェックの間隔 (秒)
+const TIMESTAMP_CHECK_INTERVAL: u64 = 30;
+
+/// エンジンスレッドのメインループ
+fn engine_thread_main(rx: mpsc::Receiver<EngineRequest>) {
+    log("engine_thread: loading engine");
+    let mut engine = load_engine();
+    log(&format!(
+        "engine_thread: engine loaded = {}",
+        engine.is_some()
+    ));
+
+    let mut timestamps = {
+        let config = Config::load().unwrap_or_default();
+        collect_dict_timestamps(&config)
+    };
+    let mut last_check = std::time::Instant::now();
+
+    loop {
+        let req = match rx.recv() {
+            Ok(req) => req,
+            Err(_) => break, // チャネルが閉じた
+        };
+
+        // タイムスタンプチェック (一定間隔)
+        if last_check.elapsed().as_secs() >= TIMESTAMP_CHECK_INTERVAL {
+            last_check = std::time::Instant::now();
+            let config = Config::load().unwrap_or_default();
+            let current = collect_dict_timestamps(&config);
+            if current != timestamps {
+                log("engine_thread: dict/model changed, reloading");
+                timestamps = current;
+                engine = load_engine();
+            }
+        }
+
+        match req {
+            EngineRequest::Convert { yomi, tx } => {
+                let result = engine
+                    .as_ref()
+                    .and_then(|e| e.convert(&yomi, None).ok())
+                    .unwrap_or_default();
+                let _ = tx.send(result);
+            }
+            EngineRequest::Learn { candidates } => {
+                if let Some(ref mut e) = engine {
+                    e.learn(&candidates);
+                }
+            }
+            EngineRequest::Shutdown => break,
+        }
+    }
+    log("engine_thread: exiting");
+}
+
 fn ensure_engine() {
     ENGINE_LOADED.with(|loaded| {
         if *loaded.borrow() {
-            // 既にロード済み → タイムスタンプの変化を確認
-            let config = Config::load().unwrap_or_default();
-            let current = collect_dict_timestamps(&config);
-            let changed = DICT_TIMESTAMPS.with(|ts| *ts.borrow() != current);
-            if !changed {
-                return; // 変化なし
-            }
-            log("ensure_engine: dict/model files changed, reloading");
-            // タイムスタンプ更新 & エンジン再ロード
-            DICT_TIMESTAMPS.with(|ts| *ts.borrow_mut() = current);
-            if let Some(engine) = load_engine() {
-                THREAD_ENGINE.with(|e| *e.borrow_mut() = Some(engine));
-            }
             return;
         }
-
-        // 初回ロード
         *loaded.borrow_mut() = true;
-        if let Some(engine) = load_engine() {
-            THREAD_ENGINE.with(|e| *e.borrow_mut() = Some(engine));
-        }
-        // キーマップをロード
+
+        // エンジンスレッドを起動 (辞書読み込みはバックグラウンドで)
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("akaza-engine".to_string())
+            .spawn(move || engine_thread_main(rx))
+            .ok();
+        ENGINE_TX.with(|t| *t.borrow_mut() = Some(tx));
+
+        // キーマップ・romkan はすぐに必要なのでここでロード
         let config = Config::load().unwrap_or_default();
-
-        // タイムスタンプを記録
-        let stamps = collect_dict_timestamps(&config);
-        DICT_TIMESTAMPS.with(|ts| *ts.borrow_mut() = stamps);
-
         match Keymap::load(&config.keymap) {
             Ok(km) => {
                 log(&format!("keymap: loaded {} entries", km.len()));
@@ -231,7 +288,6 @@ fn ensure_engine() {
             }
             Err(e) => log(&format!("keymap: load error: {e}")),
         }
-        // romkan をロード
         match RomKanConverter::default_mapping() {
             Ok(rk) => {
                 log("romkan: loaded");
@@ -243,8 +299,13 @@ fn ensure_engine() {
 }
 
 fn invalidate_engine() {
+    ENGINE_TX.with(|t| {
+        if let Some(tx) = t.borrow().as_ref() {
+            let _ = tx.send(EngineRequest::Shutdown);
+        }
+        *t.borrow_mut() = None;
+    });
     ENGINE_LOADED.with(|loaded| *loaded.borrow_mut() = false);
-    DICT_TIMESTAMPS.with(|ts| ts.borrow_mut().clear());
 }
 
 fn panic_message(p: &Box<dyn std::any::Any + Send>) -> String {
@@ -740,20 +801,20 @@ impl AkazaTextService {
         self.update_composition(context)
     }
 
-    /// エンジンから変換結果をセグメント×候補の形で取得
+    /// エンジンスレッドに変換リクエストを送り、結果を待つ
     fn convert_segments(&self, hiragana: &str) -> Vec<Vec<Candidate>> {
-        let mut result: Vec<Vec<Candidate>> = Vec::new();
-
-        THREAD_ENGINE.with(|e| {
-            let mut engine = e.borrow_mut();
-            let Some(engine) = engine.as_mut() else { return };
-            let Ok(segments) = engine.convert(hiragana, None) else {
-                return;
+        ENGINE_TX.with(|t| {
+            let t = t.borrow();
+            let Some(tx) = t.as_ref() else {
+                return Vec::new();
             };
-            result = segments;
-        });
-
-        result
+            let (resp_tx, resp_rx) = mpsc::channel();
+            let _ = tx.send(EngineRequest::Convert {
+                yomi: hiragana.to_string(),
+                tx: resp_tx,
+            });
+            resp_rx.recv().unwrap_or_default()
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -945,9 +1006,11 @@ impl AkazaTextService {
         let selected = state.selected_candidates();
         drop(state);
         if !selected.is_empty() {
-            THREAD_ENGINE.with(|e| {
-                if let Some(engine) = e.borrow_mut().as_mut() {
-                    engine.learn(&selected);
+            ENGINE_TX.with(|t| {
+                if let Some(tx) = t.borrow().as_ref() {
+                    let _ = tx.send(EngineRequest::Learn {
+                        candidates: selected,
+                    });
                 }
             });
         }
